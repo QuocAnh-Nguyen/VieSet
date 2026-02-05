@@ -9,7 +9,7 @@ This repository contains the evaluation framework for assessing the safety of LL
 
 PAPER: [LINK](https://openreview.net/pdf?id=gCm55KYiqz) 
 
-FULL DATA: [LINK](https://huggingface.co/datasets/datumo/KorSET)
+FULL DATA (KorSET): [LINK](https://huggingface.co/datasets/datumo/KorSET)
 
 ## Directory Structure
 
