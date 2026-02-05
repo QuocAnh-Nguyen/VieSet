@@ -3,8 +3,9 @@
 This is the official repository of CAGE : A Framework for Culturally Adaptive Red-Teaming Benchmark Generation (ICLR 2026)
 
 This repository contains the evaluation framework for assessing the safety of LLM prompts and responses (PER RUBRIC). It supports both **Prompt Safety Evaluation** (checking if a prompt itself is harmful) and **Response Safety Evaluation** (checking if a model's response to a prompt is harmful) using GPT-4 based judges with specific rubrics for English and Korean.
-
-<img src="assets/cage_figure.png" width="500px" height="250" title="Github_Logo"/>
+<p align="center">
+<img src="assets/cage_figure.png" width="1000px" height="600" title="Github_Logo"/>
+</p>
 
 PAPER: [LINK](https://openreview.net/pdf?id=gCm55KYiqz) 
 
