@@ -7,8 +7,6 @@ This repository contains the evaluation framework for assessing the safety of LL
 <img src="assets/cage_figure.png" width="1000px" height="600" title="Github_Logo"/>
 </p>
 
-PAPER: [LINK](https://openreview.net/pdf?id=gCm55KYiqz) 
-
 FULL DATA (KorSET): [LINK](https://huggingface.co/datasets/datumo/KorSET)
 
 ## Directory Structure
