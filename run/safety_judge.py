@@ -182,7 +182,7 @@ def main():
     parser.add_argument('--category_col', '-cc', default='category', help='Column name for category (default: category)')
     
     parser.add_argument('--mode', '-m', required=True, choices=['prompt', 'response'], help='Evaluation mode: prompt or response')
-    parser.add_argument('--lang', '-l', required=True, choices=['en', 'ko'], help='Language: en or ko')
+    parser.add_argument('--lang', '-l', required=True, choices=['en', 'ko', 'vn'], help='Language: en or ko')
     
     parser.add_argument('--model', default='gpt-4.1', help='Judge model name (default: gpt-4.1)')
     parser.add_argument('--api_key', '-a', required=True, help='OpenAI API Key')
