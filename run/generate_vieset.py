@@ -9,23 +9,32 @@ language and cultural context. Implements the full 3-stage pipeline:
   Stage 3: Translate-with-Context (Content Localization)
 
 Output is a CSV file in data/ compatible with run/safety_judge.py.
+
+Phase 1 Refactor:
+- Uses ``LLMClient`` (litellm-backed) with async generation + retry.
+- Uses ``AsyncPipelineEngine`` for concurrent stage 2 & 3 execution.
+- Uses ``CheckpointManager`` for incremental fault-tolerant saves.
 """
 
+from __future__ import annotations
+
 import argparse
+import asyncio
 import json
 import logging
 import os
 import sys
 import time
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple
+from typing import Dict, List, Optional
 
 import pandas as pd
 
 # Add project root to path (mirroring safety_judge.py pattern)
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from generate.base.generator_base import GenerationClient
+from generate.base.llm_client import LLMClient, strip_markdown_wrapper, parse_json
+from generate.base.async_engine import AsyncPipelineEngine, CheckpointManager
 from generate.template.molds import (
     CAT_CODE_TO_VN,
     RISK_DOMAINS,
@@ -61,11 +70,12 @@ DEFAULT_SEED_PATH = os.path.join(
     os.path.dirname(__file__), "..", "data", "sample_data.csv"
 )
 DEFAULT_OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
-
+DEFAULT_CHECKPOINT_DIR = os.path.join(os.path.dirname(__file__), "..", "checkpoints")
 
 # ===================================================================
 # STAGE 1: Seed Collection (taxonomy-based from input CSV)
 # ===================================================================
+
 
 def collect_seeds(
     seed_path: str,
@@ -103,35 +113,191 @@ def collect_seeds(
     if response_col in df.columns:
         df = df.rename(columns={response_col: "response"})
 
-    # Extract single-letter category code from e.g. "A. Ngôn ngữ Độc hại"
+    # Extract single-letter category code from e.g. "A. Ngon ngu Doc hai"
     df["cat_code"] = df["category"].apply(
         lambda c: c.strip()[0].upper() if c and len(c.strip()) > 0 else "A"
     )
 
-    logger.info(f"Loaded {len(df)} seed prompts across {df['cat_code'].nunique()} categories")
+    logger.info(
+        f"Loaded {len(df)} seed prompts across {df['cat_code'].nunique()} categories"
+    )
     return df
 
 
 # ===================================================================
-# STAGE 2: Refine-with-Slot (Semantic Mold creation)
+# STAGE 2: Refine-with-Slot (Semantic Mold creation)  --  ASYNC
 # ===================================================================
 
-def refine_seeds(
-    client: GenerationClient,
+
+async def refine_seeds_async(
+    client: LLMClient,
+    engine: AsyncPipelineEngine,
     seeds_df: pd.DataFrame,
     max_samples_per_cat: int = 20,
 ) -> List[Dict]:
     """
-    Convert English seed prompts into slot-tagged semantic molds.
+    Convert English seed prompts into slot-tagged semantic molds (async).
 
     Returns list of dicts with keys: seed, cat_code, refined_mold, preserved_intent.
     """
     refiner = SemanticRefiner()
+
+    # Build the list of (cat_code, row_index, seed, task_fn) entries
+    task_specs: List[Dict] = []
+    for cat_code, group in seeds_df.groupby("cat_code"):
+        samples = group.head(max_samples_per_cat)
+        logger.info(
+            f"Preparing {len(samples)} seeds for category "
+            f"{CAT_CODE_TO_VN.get(cat_code, cat_code)} ..."
+        )
+        for _, row in samples.iterrows():
+            seed = row["seed"]
+            prompt = refiner.build_refiner_prompt(seed, cat_code)
+
+            # Capture by-value in closure via default arg
+            async def _task(
+                _seed=seed,
+                _cat=cat_code,
+                _prompt=prompt,
+            ) -> dict:
+                raw = await client.agenerate_json(
+                    input_text=_prompt,
+                    system_prompt=refiner.system_prompt,
+                    temperature=0.3,
+                )
+                ok, parsed, err = parse_json(raw)
+                if not ok:
+                    logger.warning(
+                        f"Refine JSON parse failed for seed: {_seed[:60]}... | {err}"
+                    )
+                    return {
+                        "seed": _seed,
+                        "cat_code": _cat,
+                        "refined_mold": _seed,  # fallback: use original
+                        "preserved_intent": "",
+                        "parse_error": err,
+                    }
+                return {
+                    "seed": _seed,
+                    "cat_code": _cat,
+                    "refined_mold": parsed.get("refined_prompt", _seed),
+                    "preserved_intent": parsed.get("preserved_intent", ""),
+                }
+
+            task_specs.append(_task)
+
+    # Run all tasks concurrently
+    results_raw = await engine.run(tasks=task_specs, stage="refine")
+
+    # Gather successful results
+    results: List[Dict] = []
+    for idx, result, error in results_raw:
+        if error is not None:
+            logger.error(f"Refine task {idx} failed: {error}")
+        elif result is not None:
+            results.append(result)
+
+    logger.info(f"Refine complete: {len(results)} molds created")
+    return results
+
+
+# ===================================================================
+# STAGE 3: Translate-with-Context (Content Localization)  -- ASYNC
+# ===================================================================
+
+
+async def localize_molds_async(
+    client: LLMClient,
+    engine: AsyncPipelineEngine,
+    refined_molds: List[Dict],
+) -> List[Dict]:
+    """
+    Instantiate semantic molds with Vietnamese cultural content (async).
+
+    Returns list of dicts with full prompt metadata.
+    """
+    translator = VietnameseTranslator()
+
+    def _build_tasks():
+        for mold_entry in refined_molds:
+            mold_text = mold_entry.get("refined_mold", "")
+            cat_code = mold_entry.get("cat_code", "A")
+            content = get_content_for_category(cat_code)
+            content_context = json.dumps(content, ensure_ascii=False, indent=2)
+            prompt = translator.build_translator_prompt(
+                mold_text, cat_code, content_context=content_context
+            )
+
+            async def _task(
+                _mold=mold_text,
+                _cat=cat_code,
+                _prompt=prompt,
+                _entry=mold_entry,
+            ) -> dict:
+                raw = await client.agenerate_json(
+                    input_text=_prompt,
+                    system_prompt=translator.system_prompt,
+                    temperature=0.7,
+                )
+                ok, parsed, err = parse_json(raw)
+                if not ok:
+                    logger.warning(
+                        f"Translate JSON parse failed for mold: {_mold[:60]}... | {err}"
+                    )
+                    return {
+                        **_entry,
+                        "vietnamese_prompt": _mold,
+                        "filled_slots_vn": {},
+                        "cultural_anchors": [],
+                        "parse_error": err,
+                    }
+                return {
+                    **_entry,
+                    "vietnamese_prompt": parsed.get("vietnamese_prompt", _mold),
+                    "filled_slots_vn": parsed.get("filled_slots_vn", {}),
+                    "cultural_anchors": parsed.get("cultural_anchors", []),
+                }
+
+            yield _task
+
+    tasks = list(_build_tasks())
+
+    if not tasks:
+        logger.warning("No molds to localize")
+        return []
+
+    results_raw = await engine.run(tasks=tasks, stage="localize")
+
+    results: List[Dict] = []
+    for idx, result, error in results_raw:
+        if error is not None:
+            logger.error(f"Localize task {idx} failed: {error}")
+        elif result is not None:
+            results.append(result)
+
+    logger.info(f"Localize complete: {len(results)} prompts generated")
+    return results
+
+
+# ===================================================================
+# STAGE 2 (SYNC FALLBACK)
+# ===================================================================
+
+
+def refine_seeds(
+    client: LLMClient,
+    seeds_df: pd.DataFrame,
+    max_samples_per_cat: int = 20,
+) -> List[Dict]:
+    """
+    Synchronous wrapper for Stage 2 refinement.
+
+    Prefer ``refine_seeds_async`` in async contexts.
+    """
+    refiner = SemanticRefiner()
     results = []
-    total = 0
 
     for cat_code, group in seeds_df.groupby("cat_code"):
-        # Limit per category for efficiency
         samples = group.head(max_samples_per_cat)
         logger.info(
             f"Refining {len(samples)} seeds for category "
@@ -146,232 +312,250 @@ def refine_seeds(
                 raw = client.generate_json(
                     input_text=prompt,
                     system_prompt=refiner.system_prompt,
-                    temperature=0.5,
-                    max_tokens=2048,
+                    temperature=0.3,
                 )
-                parsed = json.loads(raw)
-                results.append({
-                    "seed": seed,
-                    "cat_code": cat_code,
-                    "category": CAT_CODE_TO_VN.get(cat_code, cat_code),
-                    "refined_mold": parsed.get("refined_prompt", ""),
-                    "filled_slots": parsed.get("filled_slots", {}),
-                    "preserved_intent": parsed.get("preserved_intent", ""),
-                })
-                total += 1
-            except json.JSONDecodeError as e:
-                logger.warning(
-                    f"Failed to parse refinement JSON for cat {cat_code}: {e}"
+                ok, parsed, err = parse_json(raw)
+                if not ok:
+                    logger.warning(
+                        f"Refine JSON parse failed: {err}. Using seed as fallback."
+                    )
+                    results.append(
+                        {
+                            "seed": seed,
+                            "cat_code": cat_code,
+                            "refined_mold": seed,
+                            "preserved_intent": "",
+                        }
+                    )
+                else:
+                    results.append(
+                        {
+                            "seed": seed,
+                            "cat_code": cat_code,
+                            "refined_mold": parsed.get("refined_prompt", seed),
+                            "preserved_intent": parsed.get("preserved_intent", ""),
+                        }
+                    )
+            except Exception as exc:
+                logger.error(f"Refine failed for seed '{seed[:60]}...': {exc}")
+                results.append(
+                    {
+                        "seed": seed,
+                        "cat_code": cat_code,
+                        "refined_mold": seed,
+                        "preserved_intent": "",
+                    }
                 )
-                continue
 
-            # Rate limiting
-            time.sleep(0.2)
-
-    logger.info(f"Stage 2 complete: {total} refined molds produced")
+    logger.info(f"Refine complete: {len(results)} molds created")
     return results
 
 
 # ===================================================================
-# Helper: Format content context for the translator
+# STAGE 3 (SYNC FALLBACK)
 # ===================================================================
 
-def _format_content_context(cat_code: str) -> str:
-    """Format Vietnamese cultural content from the repository for a prompt."""
-    content = get_content_for_category(cat_code)
-    if not content:
-        return ""
-
-    lines = []
-    for key, items in content.items():
-        if isinstance(items, list) and items:
-            lines.append(f"- {key}: {', '.join(items[:5])}" +
-                         (f" +{len(items)-5} more" if len(items) > 5 else ""))
-    return "\n".join(lines)
-
-
-# ===================================================================
-# STAGE 3: Translate-with-Context (Content Localization)
-# ===================================================================
 
 def localize_molds(
-    client: GenerationClient,
+    client: LLMClient,
     refined_molds: List[Dict],
 ) -> List[Dict]:
     """
-    Instantiate semantic molds with Vietnamese cultural content.
+    Synchronous wrapper for Stage 3 translation.
 
-    Returns list of dicts with keys:
-        seed, cat_code, vietnamese_prompt, filled_slots_vn, cultural_anchors.
+    Prefer ``localize_molds_async`` in async contexts.
     """
     translator = VietnameseTranslator()
     validator = PromptValidator()
     results = []
-    total = 0
-    failed = 0
 
-    for item in refined_molds:
-        cat_code = item["cat_code"]
-        refined_mold = item["refined_mold"]
-        if not refined_mold:
-            continue
-
-        content_ctx = _format_content_context(cat_code)
+    for i, mold_entry in enumerate(refined_molds):
+        mold_text = mold_entry.get("refined_mold", "")
+        cat_code = mold_entry.get("cat_code", "A")
+        content = get_content_for_category(cat_code)
+        content_context = json.dumps(content, ensure_ascii=False, indent=2)
         prompt = translator.build_translator_prompt(
-            refined_mold=refined_mold,
-            cat_code=cat_code,
-            content_context=content_ctx,
+            mold_text, cat_code, content_context=content_context
         )
 
         try:
             raw = client.generate_json(
                 input_text=prompt,
                 system_prompt=translator.system_prompt,
-                temperature=0.8,  # Higher temperature for diversity
-                max_tokens=2048,
+                temperature=0.7,
             )
-
-            is_valid, parsed, err = validator.validate_json_output(raw)
-            if not is_valid:
+            ok, parsed, err = parse_json(raw)
+            if not ok:
                 logger.warning(
-                    f"Invalid JSON from translator for cat {cat_code}: {err}"
+                    f"Translate JSON parse failed for mold {i}: {err}"
                 )
-                failed += 1
+                results.append(
+                    {
+                        **mold_entry,
+                        "vietnamese_prompt": mold_text,
+                        "filled_slots_vn": {},
+                        "cultural_anchors": [],
+                        "parse_error": err,
+                    }
+                )
                 continue
 
             vn_prompt = parsed.get("vietnamese_prompt", "")
 
-            # Additional content validation
-            valid, reason = validator.validate_single(vn_prompt, cat_code)
-            if not valid:
+            # Validate
+            is_valid, reason = validator.validate_single(vn_prompt, cat_code)
+            if not is_valid:
                 logger.warning(
-                    f"Content validation failed for cat {cat_code}: {reason}"
+                    f"Validation failed for prompt {i}: {reason}. Saving anyway."
                 )
-                failed += 1
-                continue
 
-            results.append({
-                "seed": item["seed"],
-                "cat_code": cat_code,
-                "category": item["category"],
-                "refined_mold": refined_mold,
-                "vietnamese_prompt": vn_prompt,
-                "filled_slots_vn": parsed.get("filled_slots_vn", {}),
-                "cultural_anchors": parsed.get("cultural_anchors", []),
-            })
-            total += 1
+            results.append(
+                {
+                    **mold_entry,
+                    "vietnamese_prompt": vn_prompt,
+                    "filled_slots_vn": parsed.get("filled_slots_vn", {}),
+                    "cultural_anchors": parsed.get("cultural_anchors", []),
+                    "validation": {"valid": is_valid, "reason": reason},
+                }
+            )
+        except Exception as exc:
+            logger.error(f"Translate failed for mold {i}: {exc}")
+            results.append(
+                {
+                    **mold_entry,
+                    "vietnamese_prompt": mold_text,
+                    "filled_slots_vn": {},
+                    "cultural_anchors": [],
+                }
+            )
 
-        except json.JSONDecodeError as e:
-            logger.warning(f"JSON parse error for cat {cat_code}: {e}")
-            failed += 1
-            continue
-
-        except Exception as e:
-            logger.error(f"Unexpected error for cat {cat_code}: {e}")
-            failed += 1
-            continue
-
-        # Rate limiting
-        time.sleep(0.3)
-
-    logger.info(
-        f"Stage 3 complete: {total} localized prompts ({failed} failed)"
-    )
+    logger.info(f"Localize complete: {len(results)} prompts generated")
     return results
 
 
 # ===================================================================
-# Final Output: Format for compatibility with safety_judge.py
+# Export
 # ===================================================================
 
+
 def export_dataset(
-    localized: List[Dict],
+    results: List[Dict],
     output_dir: str,
-    output_filename: str,
+    output_filename: str = "vieset_benchmark.csv",
     include_refined: bool = False,
 ) -> str:
-    """
-    Export the generated dataset to CSV format compatible with safety_judge.py.
+    """Export generated prompts to CSV."""
+    if not results:
+        logger.warning("No results to export")
+        return ""
 
-    CSV columns: domain, category, seed (prompt), response, gt
-    """
-    validator = PromptValidator()
+    os.makedirs(output_dir, exist_ok=True)
 
-    # Map cat_code to domain
-    cat_to_domain = {}
-    for domain, codes in RISK_DOMAINS.items():
-        for code in codes:
-            cat_to_domain[code] = domain
-
+    # Build output columns compatible with the evaluate pipeline
     rows = []
-    for item in localized:
-        vn_prompt = item["vietnamese_prompt"]
-        valid, _ = validator.validate_single(vn_prompt, item["cat_code"])
-        if not valid:
-            continue
-
+    for r in results:
         row = {
-            "domain": cat_to_domain.get(item["cat_code"], ""),
-            "category": item["category"],
-            "seed": vn_prompt,  # The Vietnamese prompt goes in 'seed' column
-            "response": "",      # To be filled by target LLM during evaluation
-            "gt": "TRUE",        # Ground truth: prompt IS harmful (X)
+            "domain": "",
+            "category": CAT_CODE_TO_VN.get(r.get("cat_code", ""), ""),
+            "cat_code": r.get("cat_code", ""),
+            "seed": r.get("seed", ""),
+            "vietnamese_prompt": r.get("vietnamese_prompt", ""),
+            "preserved_intent": r.get("preserved_intent", ""),
+            "cultural_anchors": json.dumps(
+                r.get("cultural_anchors", []), ensure_ascii=False
+            ),
         }
         if include_refined:
-            row["refined_mold"] = item.get("refined_mold", "")
+            row["refined_mold"] = r.get("refined_mold", "")
         rows.append(row)
 
     df = pd.DataFrame(rows)
-
-    # Deduplicate
-    before = len(df)
-    df = df.drop_duplicates(subset=["seed"])
-    after = len(df)
-    if before != after:
-        logger.info(f"Deduplication: {before} -> {after} ({before - after} removed)")
-
-    os.makedirs(output_dir, exist_ok=True)
     output_path = os.path.join(output_dir, output_filename)
     df.to_csv(output_path, index=False, encoding="utf-8-sig")
-
-    logger.info(f"Dataset exported to {output_path}: {len(df)} prompts")
-    logger.info(f"  Categories: {df['category'].value_counts().to_dict()}")
-
-    # Print cost summary
+    logger.info(f"Exported {len(df)} records to {output_path}")
     return output_path
 
 
 # ===================================================================
-# Main Pipeline Orchestrator
+# Validation & Dedup
 # ===================================================================
 
-def run_pipeline(
-    seed_path: str,
-    output_dir: str,
-    output_filename: str,
+
+def validate_and_dedup(results: List[Dict]) -> Tuple[List[Dict], Dict]:
+    """Apply PromptValidator and dedup to all results."""
+    validator = PromptValidator()
+    prompts = [r.get("vietnamese_prompt", "") for r in results]
+    cat_codes = [r.get("cat_code", "") for r in results]
+
+    valid_prompts, valid_cats, _, stats = validator.filter_valid(prompts, cat_codes)
+
+    final = [
+        r
+        for r in results
+        if r.get("vietnamese_prompt", "") in set(valid_prompts)
+    ]
+
+    # Deduplicate
+    seen = set()
+    deduped = []
+    removed = 0
+    for r in final:
+        norm = " ".join(r.get("vietnamese_prompt", "").strip().lower().split())
+        if norm in seen:
+            removed += 1
+            continue
+        seen.add(norm)
+        deduped.append(r)
+
+    dedup_stats = {**stats, "duplicates_removed": removed}
+    logger.info(
+        f"Validation+Dedup: {len(deduped)} kept, "
+        f"{stats['invalid']} invalid, {removed} duplicates"
+    )
+    return deduped, dedup_stats
+
+
+# ===================================================================
+# Orchestrator
+# ===================================================================
+
+
+async def run_pipeline_async(
+    seed_path: str = DEFAULT_SEED_PATH,
+    output_dir: str = DEFAULT_OUTPUT_DIR,
+    output_filename: str = "vieset_benchmark.csv",
     model: str = "gpt-4.1",
-    api_key: str = None,
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
     max_per_category: int = 20,
     skip_refine: bool = False,
+    max_concurrency: int = 5,
+    checkpoint_dir: Optional[str] = None,
+    # Column name overrides
     seed_prompt_col: str = "seed",
     seed_category_col: str = "category",
     seed_domain_col: str = "domain",
     seed_response_col: str = "response",
     include_refined: bool = False,
-) -> Tuple[str, Dict]:
+) -> tuple:
     """
-    Run the full CAGE generation pipeline for Vietnamese.
+    Run the full 3-stage CAGE pipeline asynchronously.
 
-    Returns:
-        Tuple of (output_path, stats_dict).
+    Returns (output_path, stats_dict).
     """
-    stats = {}
+    stats: Dict[str, object] = {}
 
-    # ---- Initialize generation client ----
-    logger.info(f"Initializing generation model: {model}")
-    client = GenerationClient(model=model, api_key=api_key)
+    # -- Setup ---------------------------------------------------------------
+    if checkpoint_dir is None:
+        checkpoint_dir = DEFAULT_CHECKPOINT_DIR
+    chkpt = CheckpointManager(checkpoint_dir)
 
-    # ---- Stage 1: Collect seeds ----
+    client = LLMClient(model=model, api_key=api_key, base_url=base_url)
+    engine = AsyncPipelineEngine(
+        client, max_concurrency=max_concurrency, checkpoint_manager=chkpt
+    )
+
+    # -- Stage 1: Collect seeds ----------------------------------------------
     logger.info("=" * 50)
     logger.info("STAGE 1: Seed Collection")
     logger.info("=" * 50)
@@ -385,55 +569,118 @@ def run_pipeline(
     stats["total_seeds"] = len(seeds_df)
     stats["categories"] = seeds_df["cat_code"].nunique()
 
-    if skip_refine:
-        logger.info("Skipping Stage 2 (refine), using seeds directly as molds")
-        refined_molds = []
-        for _, row in seeds_df.head(max_per_category * 12).iterrows():
-            refined_molds.append({
-                "seed": row["seed"],
-                "cat_code": row["cat_code"],
-                "category": CAT_CODE_TO_VN.get(row["cat_code"], row["category"]),
-                "refined_mold": row["seed"],  # Use seed directly
-                "filled_slots": {},
-                "preserved_intent": "",
-            })
+    # Try to load existing checkpoints for resume
+    refined_molds = await chkpt.load("refine_mold_success")
+    localized = await chkpt.load("localize")
+
+    if not refined_molds:
+        # -- Stage 2: Refine-with-Slot ---------------------------------------
+        logger.info("=" * 50)
+        logger.info("STAGE 2: Refine-with-Slot (async)")
+        logger.info("=" * 50)
+        if skip_refine:
+            logger.info("Skipping refinement (--skip_refine)")
+            refined_molds = [
+                {"seed": row["seed"], "cat_code": row["cat_code"], "refined_mold": row["seed"]}
+                for _, row in seeds_df.iterrows()
+            ]
+        else:
+            refined_molds = await refine_seeds_async(
+                client, engine, seeds_df, max_per_category
+            )
+            # Save success checkpoint
+            await chkpt.save("refine_mold_success", refined_molds)
+        stats["refined_molds"] = len(refined_molds)
     else:
-        # ---- Stage 2: Refine-with-Slot ----
-        logger.info("=" * 50)
-        logger.info("STAGE 2: Refine-with-Slot")
-        logger.info("=" * 50)
-        refined_molds = refine_seeds(
-            client, seeds_df, max_per_category
+        logger.info(
+            "Resumed %d refined molds from checkpoint", len(refined_molds)
         )
         stats["refined_molds"] = len(refined_molds)
 
-    # ---- Stage 3: Translate-with-Context ----
-    logger.info("=" * 50)
-    logger.info("STAGE 3: Translate-with-Context")
-    logger.info("=" * 50)
-    localized = localize_molds(client, refined_molds)
-    stats["localized_prompts"] = len(localized)
+    if not localized:
+        # -- Stage 3: Translate-with-Context ---------------------------------
+        logger.info("=" * 50)
+        logger.info("STAGE 3: Translate-with-Context (async)")
+        logger.info("=" * 50)
+        localized = await localize_molds_async(client, engine, refined_molds)
+        await chkpt.save("localize", localized)
+        stats["localized_prompts"] = len(localized)
+    else:
+        logger.info(
+            "Resumed %d localized prompts from checkpoint", len(localized)
+        )
+        stats["localized_prompts"] = len(localized)
 
-    # ---- Export ----
+    # -- Validate & Dedup ---------------------------------------------------
+    final, val_stats = validate_and_dedup(localized)
+    stats.update(val_stats)
+
+    # -- Export --------------------------------------------------------------
     logger.info("=" * 50)
     logger.info("EXPORT: Saving Final Dataset")
     logger.info("=" * 50)
     output_path = export_dataset(
-        localized, output_dir, output_filename, include_refined
+        final, output_dir, output_filename, include_refined
     )
 
-    # ---- Usage summary ----
-    stats["total_tokens"] = client.total_tokens
-    stats["total_cost_usd"] = round(client.total_cost, 4)
-    logger.info(f"Total tokens: {client.total_tokens}")
-    logger.info(f"Estimated cost: ${client.total_cost:.4f}")
+    # -- Usage summary -------------------------------------------------------
+    usage = client.usage_summary
+    stats["total_tokens"] = usage["total_tokens"]
+    stats["total_cost_usd"] = usage["total_cost_usd"]
+    logger.info(f"Total tokens: {usage['total_tokens']}")
+    logger.info(f"Estimated cost: ${usage['total_cost_usd']:.6f}")
 
     return output_path, stats
+
+
+def run_pipeline(
+    seed_path: str = DEFAULT_SEED_PATH,
+    output_dir: str = DEFAULT_OUTPUT_DIR,
+    output_filename: str = "vieset_benchmark.csv",
+    model: str = "gpt-4.1",
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+    max_per_category: int = 20,
+    skip_refine: bool = False,
+    max_concurrency: int = 5,
+    checkpoint_dir: Optional[str] = None,
+    # Column name overrides
+    seed_prompt_col: str = "seed",
+    seed_category_col: str = "category",
+    seed_domain_col: str = "domain",
+    seed_response_col: str = "response",
+    include_refined: bool = False,
+) -> tuple:
+    """
+    Synchronous entry point that delegates to async pipeline via asyncio.run.
+
+    Returns (output_path, stats_dict).
+    """
+    return asyncio.run(
+        run_pipeline_async(
+            seed_path=seed_path,
+            output_dir=output_dir,
+            output_filename=output_filename,
+            model=model,
+            api_key=api_key,
+            base_url=base_url,
+            max_per_category=max_per_category,
+            skip_refine=skip_refine,
+            max_concurrency=max_concurrency,
+            checkpoint_dir=checkpoint_dir,
+            seed_prompt_col=seed_prompt_col,
+            seed_category_col=seed_category_col,
+            seed_domain_col=seed_domain_col,
+            seed_response_col=seed_response_col,
+            include_refined=include_refined,
+        )
+    )
 
 
 # ===================================================================
 # CLI Entry Point
 # ===================================================================
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -483,18 +730,34 @@ def main():
     parser.add_argument(
         "--model", "-m",
         default="gpt-4.1",
-        help="Generator model (default: gpt-4.1)",
+        help="Generator model (default: gpt-4.1). Use 'deepseek/deepseek-chat' for DeepSeek.",
     )
     parser.add_argument(
         "--api_key", "-a",
         default=None,
-        help="OpenAI API key (default: from OPENAI_API_KEY env var)",
+        help="API key (default: from environment variable)",
+    )
+    parser.add_argument(
+        "--base_url",
+        default=None,
+        help="Custom base URL for API (e.g., https://api.deepseek.com for DeepSeek)",
     )
     parser.add_argument(
         "--max_per_category",
         type=int,
         default=20,
         help="Max seeds to generate per category (default: 20)",
+    )
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=5,
+        help="Max concurrent LLM calls (default: 5)",
+    )
+    parser.add_argument(
+        "--checkpoint_dir",
+        default=None,
+        help="Directory for incremental checkpoints (default: ../checkpoints)",
     )
 
     # Flags
@@ -524,10 +787,12 @@ def main():
             domain_col=args.domain_col,
             response_col=args.response_col,
         )
-        print(f"\nSeed summary:")
+        print(f"
+Seed summary:")
         print(f"  Total seeds: {len(seeds_df)}")
         print(f"  Categories:  {seeds_df['cat_code'].nunique()}")
-        print(f"  Per category:\n{seeds_df['cat_code'].value_counts().to_string()}")
+        print(f"  Per category:
+{seeds_df['cat_code'].value_counts().to_string()}")
         return
 
     output_path, stats = run_pipeline(
@@ -536,8 +801,11 @@ def main():
         output_filename=args.outfile,
         model=args.model,
         api_key=args.api_key,
+        base_url=args.base_url,
         max_per_category=args.max_per_category,
         skip_refine=args.skip_refine,
+        max_concurrency=args.concurrency,
+        checkpoint_dir=args.checkpoint_dir,
         seed_prompt_col=args.prompt_col,
         seed_category_col=args.category_col,
         seed_domain_col=args.domain_col,
@@ -545,12 +813,14 @@ def main():
         include_refined=args.include_refined,
     )
 
-    print(f"\n=== VieSet Generation Complete ===")
+    print(f"
+=== VieSet Generation Complete ===")
     print(f"Output:          {output_path}")
     print(f"Total prompts:   {stats.get('localized_prompts', 0)}")
     print(f"Total tokens:    {stats.get('total_tokens', 0)}")
-    print(f"Estimated cost:  ${stats.get('total_cost_usd', 0):.4f}")
-    print(f"\nTo evaluate: python run/safety_judge.py -i {output_path} "
+    print(f"Estimated cost:  ${stats.get('total_cost_usd', 0):.6f}")
+    print(f"
+To evaluate: python run/safety_judge.py -i {output_path} "
           f"-d results -o result_vn.csv -m prompt -l vn -a YOUR_API_KEY")
 
 
