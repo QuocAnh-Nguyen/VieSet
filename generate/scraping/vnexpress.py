@@ -73,6 +73,43 @@ class VnExpressScraper(BaseScraper):
         self.feeds = feeds or list(FEED_URLS.keys())
 
     # ------------------------------------------------------------------
+
+    async def _fetch_article_body(self, url: str) -> str:
+        """Fetch full article body text from a VnExpress article page."""
+        import asyncio
+        try:
+            resp = await self._fetch_with_retry(url, max_retries=2, backoff=1.0)
+            from selectolax.parser import HTMLParser
+            tree = HTMLParser(resp.text)
+            # VnExpress article content containers
+            for selector in [
+                "article.fck_detail",
+                "div.sidebar-1 > article",
+                "section.container article",
+                "div.width_common.content",
+                "article.content_detail",
+            ]:
+                body_el = tree.css_first(selector)
+                if body_el:
+                    # Remove unwanted elements
+                    for unwanted in body_el.css("div.related_news, div.box_tinlienquan, div.quangcao, iframe, script, style"):
+                        unwanted.decompose()
+                    text = body_el.text(strip=True)
+                    if text and len(text) > 100:
+                        return text[:2000]  # Cap at 2000 chars
+            # Fallback: try to find the main article text by looking for largest text block
+            candidates = []
+            for p in tree.css("p.Normal, p"):
+                t = p.text(strip=True)
+                if t and len(t) > 60:
+                    candidates.append(t)
+            if candidates:
+                return " ".join(candidates)[:2000]
+            return ""
+        except Exception as exc:
+            logger.debug("vnexpress: failed to fetch article body for %s: %s", url, exc)
+            return ""
+
     async def fetch_articles(self) -> List[ScrapedArticle]:
         """
         Fetch articles from configured RSS feeds.
@@ -131,15 +168,25 @@ class VnExpressScraper(BaseScraper):
                             if entry.get("summary")
                             else ""
                         ),
-                        content="",
+                        content="",  # filled below for a subset
                         date=entry.get("published", ""),
                         tags=tags,
                     )
                 )
                 count += 1
 
+        # Fetch full article bodies for a sample of articles (up to 10)
+        sample_for_full = articles[: min(10, len(articles))]
+        for i, art in enumerate(sample_for_full):
+            if art.url:
+                full_body = await self._fetch_article_body(art.url)
+                if full_body:
+                    articles[i].content = full_body
+                    articles[i].snippet = full_body[:300]  # replace summary with real content lead
+
         logger.info(
-            "vnexpress: fetched %d articles across %d feeds",
+            "vnexpress: fetched %d articles across %d feeds (%d with full body)",
             len(articles), len(self.feeds),
+            sum(1 for a in articles[:10] if a.content),
         )
         return articles[: self.max_articles]

@@ -124,13 +124,15 @@ async def collect_seeds(
     # Phase 2: LLM-based auto-labeling (replaces c[0].upper() string slicing)
     unique_cats = df["category"].unique().tolist()
     cat_map: Dict[str, str] = {}
+    type_map: Dict[str, str] = {}
 
     if auto_labeler is not None:
         logger.info("Auto-labeling %d unique categories via LLM/Heuristic...", len(unique_cats))
         for cat_name in unique_cats:
-            code, rationale = await auto_labeler.map_category(str(cat_name))
+            code, type_name, rationale = await auto_labeler.map_category(str(cat_name))
             cat_map[str(cat_name)] = code
-            logger.info("  %s -> %s (%s)", cat_name, code, rationale)
+            type_map[str(cat_name)] = type_name
+            logger.info("  %s -> %s / %s (%s)", cat_name, code, type_name or "-", rationale)
     else:
         # Pure heuristic fallback (no async needed)
         logger.info("No AutoLabeler provided, using heuristic mapping...")
@@ -140,6 +142,8 @@ async def collect_seeds(
             logger.info("  %s -> %s (%s)", cat_name, code, rationale)
 
     df["cat_code"] = df["category"].map(cat_map).fillna("A")
+    if type_map:
+        df["type_name"] = df["category"].map(type_map).fillna("")
 
     logger.info(
         f"Loaded {len(df)} seed prompts across {df['cat_code'].nunique()} categories"
@@ -173,15 +177,18 @@ async def refine_seeds_async(
             f"Preparing {len(samples)} seeds for category "
             f"{CAT_CODE_TO_VN.get(cat_code, cat_code)} ..."
         )
-        for _, row in samples.iterrows():
+        for row_idx, row in samples.iterrows():
             seed = row["seed"]
-            prompt = refiner.build_refiner_prompt(seed, cat_code)
+            type_name = row.get("type_name", "") if "type_name" in row.index else ""
+            prompt = refiner.build_refiner_prompt(seed, cat_code, type_name)
 
             # Capture by-value in closure via default arg
             async def _task(
                 _seed=seed,
                 _cat=cat_code,
+                _type=type_name,
                 _prompt=prompt,
+                _seed_idx=row_idx,
             ) -> dict:
                 raw = await client.agenerate_json(
                     input_text=_prompt,
@@ -196,6 +203,8 @@ async def refine_seeds_async(
                     return {
                         "seed": _seed,
                         "cat_code": _cat,
+                        "type_name": _type,
+                        "seed_index": _seed_idx,
                         "refined_mold": _seed,  # fallback: use original
                         "preserved_intent": "",
                         "parse_error": err,
@@ -203,6 +212,8 @@ async def refine_seeds_async(
                 return {
                     "seed": _seed,
                     "cat_code": _cat,
+                    "type_name": _type,
+                    "seed_index": _seed_idx,
                     "refined_mold": parsed.get("refined_prompt", _seed),
                     "preserved_intent": parsed.get("preserved_intent", ""),
                 }
@@ -629,6 +640,20 @@ async def run_pipeline_async(
     # Try to load existing checkpoints for resume
     refined_molds = await chkpt.load("refine_mold_success")
     localized = await chkpt.load("localize")
+
+    # Filter seeds_df to skip already-processed seeds on resume
+    if refined_molds:
+        processed_indices = {
+            m.get("seed_index") for m in refined_molds if "seed_index" in m
+        }
+        if processed_indices and -1 not in processed_indices:
+            before = len(seeds_df)
+            seeds_df = seeds_df[~seeds_df.index.isin(processed_indices)]
+            after = len(seeds_df)
+            logger.info(
+                "Checkpoint resume: filtered %d already-processed seeds, %d remaining",
+                before - after, after,
+            )
 
     if not refined_molds:
         # -- Stage 2: Refine-with-Slot ---------------------------------------

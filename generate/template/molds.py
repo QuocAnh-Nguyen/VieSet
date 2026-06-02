@@ -388,7 +388,13 @@ def get_slots_for_category(cat_code: str, type_name: str = None) -> dict:
     if type_name and type_name in cat["types"]:
         slots = cat["types"][type_name]
     else:
-        # Fall back to first type in the category
+        # Fall back to first type in the category; log if type_name was specified but not found
+        if type_name:
+            import logging
+            logging.getLogger(__name__).warning(
+                "type_name '%s' not found in category '%s', defaulting to first type: %s",
+                type_name, cat_code, list(cat["types"].keys())[0],
+            )
         slots = list(cat["types"].values())[0]
 
     # Normalize: if slots uses SHARED_ACTION_SLOTS key pattern, resolve

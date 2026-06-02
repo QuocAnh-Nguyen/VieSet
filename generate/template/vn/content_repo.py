@@ -484,8 +484,8 @@ def get_dynamic_snippets(cat_code: str, count: int = 3) -> List[str]:
 
 def build_context_string(
     cat_code: str,
-    max_static_keys: int = 3,
-    max_dynamic_snippets: int = 2,
+    max_static_keys: int = 2,
+    max_dynamic_snippets: int = 5,
 ) -> str:
     """
     Build a content context string that mixes static and dynamic content.

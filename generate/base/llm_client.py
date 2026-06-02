@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 # JSON markdown stripping regex
 # ---------------------------------------------------------------------------
 _JSON_FENCE_RE = re.compile(
-    r'^\s*```(?:json)?\s*\n?(.*?)\n?```\s*$',
+    r'```(?:json)?\s*\n?(.*?)\n?```',
     re.DOTALL | re.IGNORECASE,
 )
 
@@ -40,7 +40,7 @@ _JSON_FENCE_RE = re.compile(
 def strip_markdown_wrapper(raw: str) -> str:
     """Strip ```json ... ``` fences around a raw LLM response."""
     stripped = raw.strip()
-    m = _JSON_FENCE_RE.match(stripped)
+    m = _JSON_FENCE_RE.search(stripped)
     return m.group(1).strip() if m else stripped
 
 
@@ -48,14 +48,45 @@ def parse_json(raw: str) -> Tuple[bool, Optional[Dict[str, Any]], str]:
     """
     Strip markdown wrappers then parse JSON.
 
+    Handles common LLM output quirks:
+    - Markdown code fences with/without conversational filler
+    - Trailing commas before closing brackets/braces
+
     Returns (success, parsed_dict_or_None, error_message).
     """
     cleaned = strip_markdown_wrapper(raw)
+
+    # If strip_markdown_wrapper didn't find fences, try to extract
+    # the first JSON object from anywhere in the text
+    if cleaned == raw.strip():
+        brace_match = re.search(r'\{(?:[^{}]|\{[^{}]*\})*\}', cleaned, re.DOTALL)
+        if brace_match:
+            cleaned = brace_match.group(0)
+
     try:
         data = json.loads(cleaned)
+        return True, data, "OK"
     except json.JSONDecodeError as e:
-        return False, None, f"JSON decode error: {e}"
-    return True, data, "OK"
+        pass
+
+    # Stage 2: fix trailing commas and retry
+    try:
+        fixed = re.sub(r',\s*([}\]])', r'\1', cleaned)
+        data = json.loads(fixed)
+        return True, data, "OK (trailing comma fixed)"
+    except json.JSONDecodeError:
+        pass
+
+    # Stage 3: find any JSON object with relaxed matching
+    try:
+        relaxed = re.search(r'\{[^}]*"result"[^}]*\}', cleaned, re.DOTALL | re.IGNORECASE)
+        if relaxed:
+            data = json.loads(relaxed.group(0))
+            return True, data, "OK (relaxed extraction)"
+    except json.JSONDecodeError:
+        pass
+
+    return False, None, f"JSON decode error: {str(e) if 'e' in dir() else 'unknown'}"
 
 
 # ---------------------------------------------------------------------------

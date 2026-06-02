@@ -111,16 +111,53 @@ class PromptValidator:
         return vn_chars / len(non_space)
 
     @staticmethod
+    @staticmethod
     def _count_foreign_words(text: str) -> int:
         """
-        Count genuinely foreign/English words, excluding Vietnamese loanwords.
+        Count genuinely foreign/English words, excluding Vietnamese words.
 
-        Words in VN_LOANWORD_WHITELIST are treated as native Vietnamese usage.
-        Only words 3+ characters long are considered.
+        Vietnamese text is Latin-based. Words like "ban", "lam", "nam" without
+        diacritics are perfectly valid Vietnamese.  We use a two-pronged approach:
+
+        1. Words in VN_LOANWORD_WHITELIST are always treated as native.
+        2. For other Latin words, check if they appear in a Vietnamese context
+           (surrounded by diacritic-bearing characters). If so, they are likely
+           Vietnamese words missing diacritics and should not count as foreign.
+
+        Only words isolated from Vietnamese diacritic context AND not in the
+        whitelist are counted as genuinely foreign.
         """
-        words = re.findall(r'\b[a-zA-Z]{3,}\b', text.lower())
-        return sum(1 for w in words if w not in VN_LOANWORD_WHITELIST)
+        text_lower = text.lower()
 
+        # Vietnamese diacritic pattern
+        vn_diacritic = re.compile(
+            r'[àáảãạâầấẩẫậăằắẳẵặèéẻẽẹêềếểễệìíỉĩịòóỏõọôồốổỗộơờớởỡợ'
+            r'ùúủũụưừứửữựỳýỷỹỵđ'
+            r'ÀÁẢÃẠÂẦẤẨẪẬĂẰẮẲẴẶÈÉẺẼẸÊỀẾỂỄỆÌÍỈĨỊÒÓỎÕỌÔỒỐỔỖỘƠỜỚỞỠỢ'
+            r'ÙÚỦŨỤƯỪỨỬỮỰỲÝỶỸỴĐ]'
+        )
+
+        foreign_count = 0
+        for m in re.finditer(r'\b[a-zA-Z]{3,}\b', text_lower):
+            w = m.group()
+            start_idx, end_idx = m.start(), m.end()
+
+            # Always skip whitelist words
+            if w in VN_LOANWORD_WHITELIST:
+                continue
+
+            # Check context: 20-char window around the word
+            ctx_start = max(0, start_idx - 20)
+            ctx_end = min(len(text_lower), end_idx + 20)
+            context = text_lower[ctx_start:ctx_end]
+
+            # If near Vietnamese diacritics, it is a Vietnamese word
+            if vn_diacritic.search(context):
+                continue
+
+            foreign_count += 1
+
+        return foreign_count
     def validate_single(
         self,
         prompt: str,

@@ -173,8 +173,8 @@ class ThuVienPhapLuatScraper(BaseScraper):
                 continue
 
             title = title_el.text(strip=True)
-            href = title_el.attributes.get("href", "")
-            url = href if href.startswith("http") else "https://thuvienphapluat.vn" + href
+            href = title_el.attributes.get("href") or ""
+            url = href if href and href.startswith("http") else "https://thuvienphapluat.vn" + href
 
             snippet_el = item.css_first("p.snippet, div.description, .excerpt")
             snippet = snippet_el.text(strip=True) if snippet_el else title
@@ -199,6 +199,34 @@ class ThuVienPhapLuatScraper(BaseScraper):
         return articles
 
     # ------------------------------------------------------------------
+    async def _fetch_url_curl_cffi(self, url: str) -> str:
+        """Fetch a URL using curl_cffi with Chrome TLS fingerprint impersonation."""
+        import asyncio
+        try:
+            from curl_cffi import requests as curl_requests
+        except ImportError:
+            raise RuntimeError("curl_cffi not installed")
+
+        def _sync():
+            resp = curl_requests.get(
+                url,
+                impersonate="chrome124",
+                timeout=30,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/124.0.0.0 Safari/537.36"
+                    ),
+                    "Accept-Language": "vi-VN,vi;q=0.9,en;q=0.8",
+                    "Accept": "text/html,application/xhtml+xml",
+                },
+            )
+            resp.raise_for_status()
+            return resp.text
+
+        return await asyncio.to_thread(_sync)
+
     async def fetch_articles(self) -> List[ScrapedArticle]:
         """Fetch legal texts for configured categories, with fallback."""
         client = get_shared_http_client()
@@ -214,8 +242,13 @@ class ThuVienPhapLuatScraper(BaseScraper):
             hints_list = page_info.get("hint", [])
 
             try:
-                resp = await self._fetch_with_retry(url, max_retries=2, backoff=1.5)
-                parsed = self._parse_search_page(resp.text, cat_code)
+                # Try curl_cffi first (Cloudflare bypass), fall back to httpx
+                try:
+                    html_text = await self._fetch_url_curl_cffi(url)
+                except Exception:
+                    resp = await self._fetch_with_retry(url, max_retries=2, backoff=1.5)
+                    html_text = resp.text
+                parsed = self._parse_search_page(html_text, cat_code)
                 all_articles.extend(parsed[: self.max_articles])
                 logger.debug(
                     "thuvienphapluat: fetched %d items for cat %s (%s)",

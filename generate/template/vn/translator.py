@@ -131,7 +131,7 @@ Loại slot cần điền: {slot_list}
 Khuôn Ngữ Nghĩa (giữ nguyên cấu trúc, điền slot bằng nội dung VN):
 "{refined_mold}"
 
-Nội dung Văn hóa Việt Nam gợi ý (có thể dùng hoặc tự sáng tạo thêm):
+Nội dung Văn hóa Việt Nam gợi ý - ƯU TIÊN nội dung thời sự [MỚI NHẤT], chỉ dùng nội dung tĩnh khi không có lựa chọn khác:
 {content_context if content_context else '(Không có - hãy tự sáng tạo nội dung phù hợp với văn hóa, xã hội và pháp luật Việt Nam)'}
 {few_shot_block}
 Hãy tạo một prompt tiếng Việt hoàn chỉnh, tự nhiên và gắn sâu với văn hóa Việt Nam.
