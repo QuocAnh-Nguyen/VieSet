@@ -19,7 +19,8 @@ import re
 import importlib
 
 import pandas as pd
-from openai import AsyncOpenAI
+
+from generate.base.llm_client import LLMClient, strip_markdown_wrapper, parse_json as llm_parse_json
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -57,57 +58,90 @@ def _strip_markdown(raw: str) -> str:
 
 def parse_result_from_json(json_str: str) -> str:
     """
-    Extracts the 'result' value from the JSON string. (O or X)
+    Extracts the 'result' value from a (possibly malformed) JSON string.
 
-    Uses json.loads first, then a robust regex fallback.
+    Multi-stage parsing with progressive fallbacks:
+    1. Standard json.loads after markdown stripping
+    2. Fix trailing commas then retry
+    3. Regex extraction as last resort
     """
     cleaned = _strip_markdown(json_str)
+
+    # Stage 1: direct JSON parse
     try:
         data = json.loads(cleaned)
-        return data.get("result", "Error")
-    except json.JSONDecodeError:
-        # Robust regex: case-insensitive, handles whitespace/newlines
-        match = re.search(r'"result"\s*:\s*"(o|x)"', cleaned, re.IGNORECASE)
-        if match:
-            return match.group(1).upper()
-        return "Error"
-    except Exception:
-        return "Error"
+        val = str(data.get("result", "")).strip().upper()
+        if val in ("O", "X"):
+            return val
+    except (json.JSONDecodeError, TypeError):
+        pass
 
+    # Stage 2: fix trailing commas and retry
+    try:
+        fixed = re.sub(r',\s*([}\]])', r'\1', cleaned)
+        brace_match = re.search(r'\{.*\}', fixed, re.DOTALL)
+        if brace_match:
+            fixed = brace_match.group(0)
+        data = json.loads(fixed)
+        val = str(data.get("result", "")).strip().upper()
+        if val in ("O", "X"):
+            return val
+    except (json.JSONDecodeError, TypeError):
+        pass
 
+    # Stage 3: regex extraction - handles whitespace, quote, and case variations
+    # Pattern: "result" : "X",  'result': 'O',  result: X, "RESULT":"o", etc.
+    patterns = [
+        re.compile(r'"result"\s*:\s*"([OXox])"', re.IGNORECASE),
+        re.compile(r'"result"\s*:\s*([OXox])[,\s}]', re.IGNORECASE),
+        re.compile(r'result["\'\s:]+([OXox])', re.IGNORECASE),
+        re.compile(r'\b([OXox])\b.*result', re.IGNORECASE),
+    ]
+    for pat in patterns:
+        m = pat.search(cleaned)
+        if m:
+            return m.group(1).upper()
+
+    return "Error"
 # ---------------------------------------------------------------------------
-# Async Judge (native AsyncOpenAI)
+# Async Judge (Phase 3: uses LLMClient with retry + cost tracking)
 # ---------------------------------------------------------------------------
 class CustomJudge:
     """
-    Async safety judge using OpenAI SDK natively.
+    Async safety judge using the unified LLMClient from Phase 1.
 
-    Replaces the ``run_in_executor`` anti-pattern with a proper async client.
+    Benefits:
+    - Automatic retry with exponential backoff (tenacity)
+    - Provider routing via litellm (OpenAI, DeepSeek, etc.)
+    - Built-in cost tracking
+    - JSON output with markdown stripping
     """
 
-    def __init__(self, model: str = "gpt-4.1", api_key: str = None) -> None:
+    def __init__(self, model: str = "gpt-4.1", api_key: str = None,
+                 base_url: str = None) -> None:
         if api_key is None:
             api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
             raise ValueError("OPENAI_API_KEY must be set or passed explicitly")
 
         self.model = model
-        self.client = AsyncOpenAI(api_key=api_key)
+        self.client = LLMClient(model=model, api_key=api_key, base_url=base_url)
 
     async def judge(self, system_prompt: str, user_prompt: str) -> str:
-        """Async safety evaluation call."""
+        """Async safety evaluation with retry and JSON output."""
+        # Ensure system prompt explicitly asks for JSON (required by strict-JSON mode)
+        json_system = system_prompt
+        if "JSON" not in json_system and "json" not in json_system.lower():
+            json_system = json_system + "\n\nYou MUST respond with valid JSON only."
+
         try:
-            comp = await self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
+            raw = await self.client.agenerate_json(
+                input_text=user_prompt,
+                system_prompt=json_system,
                 temperature=0.0,
                 max_tokens=1024,
-                response_format={"type": "json_object"},
             )
-            return comp.choices[0].message.content or "{}"
+            return raw
         except Exception as e:
             logging.error(f"Judge Error: {e}")
             return "{}"
@@ -146,6 +180,7 @@ async def main_async(
     model: str,
     api_key: str,
     max_concurrency: int = 10,
+    base_url: str = None,
 ):
     # 1. Load data
     if not os.path.exists(input_csv):
@@ -201,7 +236,7 @@ async def main_async(
 
     # 4. Initialize Judge model
     logging.info(f"Initializing Judge Model: {model}")
-    judge_model = CustomJudge(model=model, api_key=api_key)
+    judge_model = CustomJudge(model=model, api_key=api_key, base_url=base_url)
 
     # 5. Run with bounded concurrency via semaphore
     logging.info(
@@ -298,10 +333,15 @@ def main():
     parser.add_argument(
         "--model",
         default="gpt-4.1",
-        help="Judge model name (default: gpt-4.1)",
+        help="Judge model name (default: gpt-4.1). Use 'deepseek/deepseek-chat' for DeepSeek.",
     )
     parser.add_argument(
-        "--api_key", "-a", required=True, help="OpenAI API Key"
+        "--base_url",
+        default=None,
+        help="Custom base URL for API (e.g., https://api.deepseek.com for DeepSeek)",
+    )
+    parser.add_argument(
+        "--api_key", "-a", required=True, help="API Key"
     )
     parser.add_argument(
         "--concurrency",
@@ -325,6 +365,7 @@ def main():
             model=args.model,
             api_key=args.api_key,
             max_concurrency=args.concurrency,
+            base_url=args.base_url,
         )
     )
 

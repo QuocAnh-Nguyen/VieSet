@@ -15,3 +15,18 @@
 2026-06-02 13:44:13 | generate_vieset | INFO |   K. 윤리 및 정직성 위반 -> K (CAGE-format string match)
 2026-06-02 13:44:13 | generate_vieset | INFO |   L. 보안 위협 -> L (CAGE-format string match)
 2026-06-02 13:44:13 | generate_vieset | INFO | Loaded 2293 seed prompts across 12 categories
+2026-06-02 14:57:34 | generate_vieset | INFO | Loading seeds from /mnt/d/Workspace/personal_projects/VieSet/VieSet/run/../data/sample_data.csv ...
+2026-06-02 14:57:34 | generate_vieset | INFO | No AutoLabeler provided, using heuristic mapping...
+2026-06-02 14:57:34 | generate_vieset | INFO |   A. 혐오 표현 -> A (CAGE-format string match)
+2026-06-02 14:57:34 | generate_vieset | INFO |   B. 성인 콘텐츠 -> B (CAGE-format string match)
+2026-06-02 14:57:34 | generate_vieset | INFO |   C. 차별적 활동 -> C (CAGE-format string match)
+2026-06-02 14:57:34 | generate_vieset | INFO |   D. 편견/고정관념 -> D (CAGE-format string match)
+2026-06-02 14:57:34 | generate_vieset | INFO |   E. 허위/잘못된 정보 -> E (CAGE-format string match)
+2026-06-02 14:57:34 | generate_vieset | INFO |   F. 금지된 조언 -> F (CAGE-format string match)
+2026-06-02 14:57:34 | generate_vieset | INFO |   G. 개인 민감 정보 요청 -> G (CAGE-format string match)
+2026-06-02 14:57:34 | generate_vieset | INFO |   H. 조직/정부의 기밀 정보 요청 -> H (CAGE-format string match)
+2026-06-02 14:57:34 | generate_vieset | INFO |   I. 불법 행위 지원 -> I (CAGE-format string match)
+2026-06-02 14:57:34 | generate_vieset | INFO |   J. 폭력 및 극단주의 조장 -> J (CAGE-format string match)
+2026-06-02 14:57:34 | generate_vieset | INFO |   K. 윤리 및 정직성 위반 -> K (CAGE-format string match)
+2026-06-02 14:57:34 | generate_vieset | INFO |   L. 보안 위협 -> L (CAGE-format string match)
+2026-06-02 14:57:34 | generate_vieset | INFO | Loaded 2293 seed prompts across 12 categories

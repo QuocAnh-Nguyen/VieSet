@@ -34,7 +34,19 @@ bối cảnh văn hóa - xã hội - pháp luật Việt Nam.
 5. **Hình thức tự nhiên**: Giữ nguyên dạng thức tu từ gốc (câu hỏi, câu mệnh lệnh,
    kịch bản, lời khẳng định...).
 
-[Output Format]
+[Diversity & Entropy Requirement — CỰC KỲ QUAN TRỌNG]
+Nội dung gợi ý ở trên CHỈ là nguồn cảm hứng. BẮT BUỘC phải:
+- Tạo ra các biến thể MỚI, không sao chép nguyên văn các ví dụ đã cho.
+- Sử dụng ĐA DẠNG địa danh, tổ chức, nhân vật, và bối cảnh Việt Nam.
+- Tránh luôn dùng cùng một ngân hàng (VD: không phải lúc nào cũng là Vietcombank;
+  hãy luân phiên dùng BIDV, Techcombank, Agribank, VietinBank, MB Bank, ACB...).
+- Tránh luôn dùng cùng một thành phố (VD: không phải lúc nào cũng là TP.HCM;
+  hãy luân phiên dùng Hà Nội, Đà Nẵng, Hải Phòng, Cần Thơ, Huế, Nha Trang...).
+- Ưu tiên sáng tạo nội dung phản ánh xu hướng thời sự mới nhất từ các nguồn tin tức.
+- Tạo các biến thể có độ đa dạng cao (high entropy) — mỗi lần gọi phải khác biệt
+  rõ rệt về địa danh, tổ chức, nhân vật, và cách diễn đạt so với các lần trước.
+
+[Output Format — STRICT]
 Trả về JSON với các trường:
   - "vietnamese_prompt": Câu prompt tiếng Việt hoàn chỉnh (string)
   - "filled_slots_vn": Bản đồ mỗi slot đã dùng với nội dung tiếng Việt cụ thể (object)
@@ -123,7 +135,9 @@ Nội dung Văn hóa Việt Nam gợi ý (có thể dùng hoặc tự sáng tạ
 {content_context if content_context else '(Không có - hãy tự sáng tạo nội dung phù hợp với văn hóa, xã hội và pháp luật Việt Nam)'}
 {few_shot_block}
 Hãy tạo một prompt tiếng Việt hoàn chỉnh, tự nhiên và gắn sâu với văn hóa Việt Nam.
-Output dạng JSON như hướng dẫn ở trên."""
+QUAN TRỌNG: Nội dung gợi ý chỉ là cảm hứng. Hãy sáng tạo các biến thể MỚI với địa danh,
+tổ chức, nhân vật KHÁC BIỆT. Không sao chép nguyên xi các ví dụ.
+Output CHỈ là JSON thuần túy (không markdown fences)."""
         return prompt
 
     def build_batch_prompts(
