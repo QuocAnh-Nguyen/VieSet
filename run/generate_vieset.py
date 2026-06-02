@@ -44,7 +44,10 @@ from generate.template.molds import (
 )
 from generate.template.refiner import SemanticRefiner
 from generate.template.vn.translator import VietnameseTranslator
-from generate.template.vn.content_repo import get_content_for_category
+from generate.template.vn.content_repo import (
+    get_content_for_category, build_context_string, inject_dynamic_content
+)
+from generate.auto_labeler import AutoLabeler
 from generate.utils.validator import PromptValidator
 
 # ---------------------------------------------------------------------------
@@ -77,18 +80,23 @@ DEFAULT_CHECKPOINT_DIR = os.path.join(os.path.dirname(__file__), "..", "checkpoi
 # ===================================================================
 
 
-def collect_seeds(
+async def collect_seeds(
     seed_path: str,
     prompt_col: str = "seed",
     domain_col: str = "domain",
     category_col: str = "category",
     response_col: str = "response",
+    auto_labeler: "Optional[AutoLabeler]" = None,
 ) -> pd.DataFrame:
     """
     Load seed prompts from input CSV and map to CAGE taxonomy.
 
+    Uses LLM-based AutoLabeler (Phase 2) when available to map
+    arbitrary source categories to CAGE codes A-L. Falls back to
+    keyword heuristics if no labeler is provided.
+
     Mirrors the structure expected by safety_judge.py.
-    Returns DataFrame with columns: domain, category, seed, response.
+    Returns DataFrame with columns: domain, category, seed, response, cat_code.
     """
     if not os.path.exists(seed_path):
         raise FileNotFoundError(f"Seed file not found: {seed_path}")
@@ -113,10 +121,25 @@ def collect_seeds(
     if response_col in df.columns:
         df = df.rename(columns={response_col: "response"})
 
-    # Extract single-letter category code from e.g. "A. Ngon ngu Doc hai"
-    df["cat_code"] = df["category"].apply(
-        lambda c: c.strip()[0].upper() if c and len(c.strip()) > 0 else "A"
-    )
+    # Phase 2: LLM-based auto-labeling (replaces c[0].upper() string slicing)
+    unique_cats = df["category"].unique().tolist()
+    cat_map: Dict[str, str] = {}
+
+    if auto_labeler is not None:
+        logger.info("Auto-labeling %d unique categories via LLM/Heuristic...", len(unique_cats))
+        for cat_name in unique_cats:
+            code, rationale = await auto_labeler.map_category(str(cat_name))
+            cat_map[str(cat_name)] = code
+            logger.info("  %s -> %s (%s)", cat_name, code, rationale)
+    else:
+        # Pure heuristic fallback (no async needed)
+        logger.info("No AutoLabeler provided, using heuristic mapping...")
+        for cat_name in unique_cats:
+            code, rationale = AutoLabeler.heuristic_map(str(cat_name))
+            cat_map[str(cat_name)] = code
+            logger.info("  %s -> %s (%s)", cat_name, code, rationale)
+
+    df["cat_code"] = df["category"].map(cat_map).fillna("A")
 
     logger.info(
         f"Loaded {len(df)} seed prompts across {df['cat_code'].nunique()} categories"
@@ -222,8 +245,12 @@ async def localize_molds_async(
         for mold_entry in refined_molds:
             mold_text = mold_entry.get("refined_mold", "")
             cat_code = mold_entry.get("cat_code", "A")
-            content = get_content_for_category(cat_code)
-            content_context = json.dumps(content, ensure_ascii=False, indent=2)
+            # Phase 2: mixed static + dynamic content via build_context_string
+            content_context = build_context_string(cat_code)
+            if not content_context:
+                # Fall back to full static dict if no dynamic content available
+                content = get_content_for_category(cat_code)
+                content_context = json.dumps(content, ensure_ascii=False, indent=2)
             prompt = translator.build_translator_prompt(
                 mold_text, cat_code, content_context=content_context
             )
@@ -537,9 +564,15 @@ async def run_pipeline_async(
     seed_domain_col: str = "domain",
     seed_response_col: str = "response",
     include_refined: bool = False,
+    enable_auto_label: bool = True,
+    enable_dynamic_content: bool = False,
 ) -> tuple:
     """
     Run the full 3-stage CAGE pipeline asynchronously.
+
+    Phase 2 additions:
+    - ``enable_auto_label``: use LLM-based AutoLabeler for seed category mapping
+    - ``enable_dynamic_content``: fetch and inject scraped VN news/legal content
 
     Returns (output_path, stats_dict).
     """
@@ -559,12 +592,36 @@ async def run_pipeline_async(
     logger.info("=" * 50)
     logger.info("STAGE 1: Seed Collection")
     logger.info("=" * 50)
-    seeds_df = collect_seeds(
+    # Phase 2: Optional auto-labeling and dynamic content
+    auto_labeler = None
+    if enable_auto_label:
+        auto_labeler = AutoLabeler(client=client)
+
+    if enable_dynamic_content:
+        logger.info("Fetching dynamic content from Vietnamese sources...")
+        try:
+            from generate.scraping.vnexpress import VnExpressScraper
+            from generate.scraping.base import ScraperCache
+            cache = ScraperCache()
+            vne = VnExpressScraper(cache=cache, max_articles=30)
+            articles = await vne.get_articles()
+            # Map scraped articles to category hints and inject
+            for art in articles:
+                for tag in art.tags:
+                    if len(tag) == 1 and tag in "ABCDEFGHIJKL":
+                        inject_dynamic_content(tag, [art])
+                        break
+            logger.info("Injected %d dynamic articles into content repo", len(articles))
+        except Exception as exc:
+            logger.warning("Dynamic content fetch failed (continuing without): %s", exc)
+
+    seeds_df = await collect_seeds(
         seed_path,
         prompt_col=seed_prompt_col,
         category_col=seed_category_col,
         domain_col=seed_domain_col,
         response_col=seed_response_col,
+        auto_labeler=auto_labeler,
     )
     stats["total_seeds"] = len(seeds_df)
     stats["categories"] = seeds_df["cat_code"].nunique()
@@ -772,6 +829,24 @@ def main():
         help="Include refined mold column in output CSV",
     )
     parser.add_argument(
+        "--enable_auto_label",
+        action="store_true",
+        default=True,
+        help="Use LLM-based AutoLabeler for seed category mapping (default: on)",
+    )
+    parser.add_argument(
+        "--no_auto_label",
+        action="store_false",
+        dest="enable_auto_label",
+        help="Disable LLM auto-labeling, use heuristic fallback only",
+    )
+    parser.add_argument(
+        "--dynamic_content",
+        action="store_true",
+        default=False,
+        help="Fetch dynamic content from VN news/legal sources before generation",
+    )
+    parser.add_argument(
         "--dry_run",
         action="store_true",
         help="Load seeds and print stats without generating",
@@ -780,19 +855,19 @@ def main():
     args = parser.parse_args()
 
     if args.dry_run:
-        seeds_df = collect_seeds(
-            args.input,
-            prompt_col=args.prompt_col,
-            category_col=args.category_col,
-            domain_col=args.domain_col,
-            response_col=args.response_col,
-        )
-        print(f"
-Seed summary:")
+        async def _dry():
+            return await collect_seeds(
+                args.input,
+                prompt_col=args.prompt_col,
+                category_col=args.category_col,
+                domain_col=args.domain_col,
+                response_col=args.response_col,
+            )
+        seeds_df = asyncio.run(_dry())
+        print("\nSeed summary:")
         print(f"  Total seeds: {len(seeds_df)}")
         print(f"  Categories:  {seeds_df['cat_code'].nunique()}")
-        print(f"  Per category:
-{seeds_df['cat_code'].value_counts().to_string()}")
+        print(f"  Per category:\n{seeds_df['cat_code'].value_counts().to_string()}")
         return
 
     output_path, stats = run_pipeline(
@@ -811,16 +886,16 @@ Seed summary:")
         seed_domain_col=args.domain_col,
         seed_response_col=args.response_col,
         include_refined=args.include_refined,
+        enable_auto_label=args.enable_auto_label,
+        enable_dynamic_content=args.dynamic_content,
     )
 
-    print(f"
-=== VieSet Generation Complete ===")
+    print("\n=== VieSet Generation Complete ===")
     print(f"Output:          {output_path}")
     print(f"Total prompts:   {stats.get('localized_prompts', 0)}")
     print(f"Total tokens:    {stats.get('total_tokens', 0)}")
     print(f"Estimated cost:  ${stats.get('total_cost_usd', 0):.6f}")
-    print(f"
-To evaluate: python run/safety_judge.py -i {output_path} "
+    print("\nTo evaluate: python run/safety_judge.py -i {output_path} "
           f"-d results -o result_vn.csv -m prompt -l vn -a YOUR_API_KEY")
 
 

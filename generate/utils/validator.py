@@ -6,6 +6,9 @@ Ensures generated Vietnamese prompts meet quality standards:
 - Category consistency checks
 - Deduplication
 - Compatibility with the evaluate/ pipeline
+
+Phase 2 fix: English-word check now excludes Vietnamese loanwords
+(e.g. "video", "livestream", "app", "online", "Facebook", etc.).
 """
 
 import re
@@ -18,9 +21,17 @@ logger = logging.getLogger(__name__)
 
 # Vietnamese-specific character set (Latin-based with diacritics)
 VN_CHAR_PATTERN = re.compile(
-    r'[a-zA-ZÀÁÂÃÈÉÊÌÍÒÓÔÕÙÚĂĐĨŨƠàáâãèéêìíòóôõùúăđĩũơ'
-    r'ƯĂẠẢẤẦẨẪẬẮẰẲẴẶẸẺẼỀỀỂỄỆỈỊỌỎỐỒỔỖỘỚỜỞỠỢỤỦỨỪỬỮỰỲỴÝỶỸ'
-    r'ưăạảấầẩẫậắằẳẵặẹẻẽềềểễệỉịọỏốồổỗộớờởỡợụủứừửữựỳỵỷỹ\s]'
+    r'[a-zA-Z\xc0\xc1\xc2\xc3\xc8\xc9\xca\xcc\xcd\xd2\xd3\xd4\xd5\xd9\xda'
+    r'\u0102\u0110\u0128\u0168\u01a0\xe0\xe1\xe2\xe3\xe8\xe9\xea\xec\xed'
+    r'\xf2\xf3\xf4\xf5\xf9\xfa\u0103\u0111\u0129\u0169\u01a1'
+    r'\u01af\u0102\u1ea0\u1ea2\u1ea4\u1ea6\u1ea8\u1eaa\u1eac\u1eae\u1eb0\u1eb2'
+    r'\u1eb4\u1eb6\u1eb8\u1eba\u1ebc\u1ec0\u1ec0\u1ec2\u1ec4\u1ec6\u1ec8\u1eca'
+    r'\u1ecc\u1ece\u1ed0\u1ed2\u1ed4\u1ed6\u1ed8\u1eda\u1edc\u1ede\u1ee0\u1ee2'
+    r'\u1ee4\u1ee6\u1ee8\u1eea\u1eec\u1eee\u1ef0\u1ef2\u1ef4\u1ef6\u1ef8'
+    r'\u01b0\u0103\u1ea1\u1ea3\u1ea5\u1ea7\u1ea9\u1eab\u1ead\u1eaf\u1eb1\u1eb3'
+    r'\u1eb5\u1eb7\u1eb9\u1ebb\u1ebd\u1ec1\u1ec1\u1ec3\u1ec5\u1ec7\u1ec9\u1ecb'
+    r'\u1ecd\u1ecf\u1ed1\u1ed3\u1ed5\u1ed7\u1ed9\u1edb\u1edd\u1edf\u1ee1\u1ee3'
+    r'\u1ee5\u1ee7\u1ee9\u1eeb\u1eed\u1eef\u1ef1\u1ef3\u1ef5\u1ef7\u1ef9\s]'
 )
 
 # Minimum prompt length in characters
@@ -28,6 +39,48 @@ MIN_PROMPT_LENGTH = 20
 
 # Maximum prompt length (to avoid excessively long generations)
 MAX_PROMPT_LENGTH = 2000
+
+# ---------------------------------------------------------------------------
+# Vietnamese loanword whitelist (Phase 2 fix)
+# Words below are commonly used in everyday Vietnamese text and should NOT
+# be counted as "English" by the validator.
+# ---------------------------------------------------------------------------
+VN_LOANWORD_WHITELIST: set = {
+    # Tech / Internet
+    "video", "livestream", "stream", "app", "online", "offline",
+    "website", "web", "link", "post", "share", "like", "comment",
+    "chat", "sms", "wifi", "bluetooth", "usb", "sim", "card",
+    "smartphone", "laptop", "tablet", "pc", "software", "hardware",
+    "upload", "download", "login", "logout", "click", "copy",
+    "paste", "email", "gmail", "facebook", "youtube", "tiktok",
+    "zalo", "viber", "telegram", "instagram", "twitter",
+    "messenger", "whatsapp", "snapchat", "wechat",
+    # Business / Finance
+    "bank", "atm", "visa", "mastercard", "momo", "zalopay",
+    "shopee", "lazada", "tiki", "grab", "be", "now",
+    "marketing", "ceo", "cfo", "staff", "team", "meeting",
+    "report", "sale", "discount", "voucher", "order",
+    # Common everyday
+    "ok", "okay", "bye", "hello", "sorry", "thanks", "please",
+    "sexy", "hot", "cool", "fan", "idol", "show", "live",
+    "karaoke", "cafe", "bar", "club", "pub", "hotel", "resort",
+    "buffet", "sushi", "pizza", "burger", "beefsteak", "beer",
+    "wine", "cocktail", "coffee", "milk", "tea",
+    # Medical / Health
+    "covid", "virus", "test", "kit", "vitamin", "calcium",
+    "omega", "collagen", "spa", "massage", "yoga", "gym",
+    "fitness", "cardio", "pilates",
+    # Transport
+    "taxi", "bus", "metro", "uber", "xe", "suv", "sedan",
+    # Vietnamese brands / organizations (no-diacritics form)
+    "vietcombank", "vietinbank", "bidv", "agribank", "techcombank",
+    "vietjet", "vietnamairlines", "bamboo", "viettel", "mobifone",
+    "vinaphone", "fpt", "vnpt", "vng",
+    # Vietnamese places (no-diacritics form)
+    "hanoi", "saigon", "hcm", "hcmc", "danang", "hue", "nhatrang",
+    "cantho", "haiphong", "dalat", "vungtau", "phuquoc",
+    "vietnam", "vietnamese",
+}
 
 
 class PromptValidator:
@@ -56,6 +109,17 @@ class PromptValidator:
             return 0.0
         vn_chars = len(VN_CHAR_PATTERN.findall(non_space))
         return vn_chars / len(non_space)
+
+    @staticmethod
+    def _count_foreign_words(text: str) -> int:
+        """
+        Count genuinely foreign/English words, excluding Vietnamese loanwords.
+
+        Words in VN_LOANWORD_WHITELIST are treated as native Vietnamese usage.
+        Only words 3+ characters long are considered.
+        """
+        words = re.findall(r'\b[a-zA-Z]{3,}\b', text.lower())
+        return sum(1 for w in words if w not in VN_LOANWORD_WHITELIST)
 
     def validate_single(
         self,
@@ -89,10 +153,16 @@ class PromptValidator:
                 f"(ratio {vn_ratio:.2f} < {self.min_vn_ratio})"
             )
 
-        # Check for excessive English mixed in
-        english_word_count = len(re.findall(r'\b[a-zA-Z]{3,}\b', prompt_stripped))
-        if english_word_count > 5:
-            return False, f"Too many English words ({english_word_count})"
+        # Check for excessive English, excluding Vietnamese loanwords
+        foreign_count = self._count_foreign_words(prompt_stripped)
+        # Allow proportional threshold: ~10% of word count or at most 8 words
+        total_words = len(prompt_stripped.split())
+        max_allowed = max(5, int(total_words * 0.12))
+        if foreign_count > max_allowed:
+            return False, (
+                f"Too many foreign words ({foreign_count}) "
+                f"vs {total_words} total words (max {max_allowed} allowed)"
+            )
 
         return True, "OK"
 

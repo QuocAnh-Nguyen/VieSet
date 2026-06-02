@@ -432,3 +432,93 @@ def get_content_for_category(cat_code: str, key: str = None) -> dict:
 def get_all_content_keys(cat_code: str) -> list:
     """List available content keys for a category."""
     return list(CONTENT_REPO.get(cat_code, {}).keys())
+
+
+# ================================================================
+# Dynamic Content Integration (Phase 2)
+# ================================================================
+# The functions below let the pipeline mix static dictionaries with
+# fresh scraped content.  Static content serves as a reliable base;
+# dynamic content adds temporal relevance and diversity.
+
+import random
+from typing import List, Optional
+
+_DYNAMIC_CACHE: dict = {}   # cat_code -> list of content snippets
+
+
+def inject_dynamic_content(
+    cat_code: str,
+    articles: list,  # list of ScrapedArticle or dicts with 'title','snippet','tags'
+) -> None:
+    """Store scraped articles keyed by CAGE category code for later use."""
+    if cat_code not in _DYNAMIC_CACHE:
+        _DYNAMIC_CACHE[cat_code] = []
+    for art in articles:
+        if isinstance(art, str):
+            title, snippet = art, ''
+        elif hasattr(art, 'title') and hasattr(art, 'snippet'):
+            # ScrapedArticle or similar object
+            title = getattr(art, 'title', '')
+            snippet = getattr(art, 'snippet', '')
+        elif isinstance(art, dict):
+            title = art.get('title', '')
+            snippet = art.get('snippet', '')
+        else:
+            title = str(art)
+            snippet = ''
+        if title or snippet:
+            _DYNAMIC_CACHE[cat_code].append(f"{title}: {snippet}"[:400])
+    # Keep only the last 200 entries per category
+    if len(_DYNAMIC_CACHE[cat_code]) > 200:
+        _DYNAMIC_CACHE[cat_code] = _DYNAMIC_CACHE[cat_code][-200:]
+
+
+def get_dynamic_snippets(cat_code: str, count: int = 3) -> List[str]:
+    """Get random dynamic content snippets for a category."""
+    pool = _DYNAMIC_CACHE.get(cat_code, [])
+    if not pool:
+        return []
+    return random.sample(pool, min(count, len(pool)))
+
+
+def build_context_string(
+    cat_code: str,
+    max_static_keys: int = 3,
+    max_dynamic_snippets: int = 2,
+) -> str:
+    """
+    Build a content context string that mixes static and dynamic content.
+
+    This is the main function called by the translator to provide
+    culturally-grounded Vietnamese content for a given category.
+
+    Returns a formatted string of Vietnamese context items.
+    """
+    lines = []
+
+    # Static content (existing dictionaries)
+    static = CONTENT_REPO.get(cat_code, {})
+    if static:
+        keys = list(static.keys())
+        if len(keys) > max_static_keys:
+            keys = random.sample(keys, max_static_keys)
+        for key in keys:
+            items = static[key]
+            if isinstance(items, list) and items:
+                sample = random.sample(items, min(3, len(items)))
+                lines.append(f"- {key}: {', '.join(sample)}")
+
+    # Dynamic content (scraped)
+    dynamic = get_dynamic_snippets(cat_code, max_dynamic_snippets)
+    if dynamic:
+        lines.append("\n[Nội dung thời sự mới nhất]")
+        for d in dynamic:
+            lines.append(f"- {d}")
+
+    return "\n".join(lines)
+
+
+def clear_dynamic_cache() -> None:
+    """Clear all stored dynamic content."""
+    _DYNAMIC_CACHE.clear()
